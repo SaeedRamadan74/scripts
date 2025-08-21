@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Bulk-set IMDS to required/enabled for instances in the current region.
+
+Usage:
+  set-imds-region.sh [--region REGION]
+                     [--state running,stopped,...]
+                     [--name NAME]
+                     [--tag Key=Value]
+                     [--instance-ids "i-abc i-def ..."]
+                     [--parallel 8]
+                     [--dry-run]
+                     [-h|--help]
+
+Defaults:
+  --state running
+  --parallel 8
+Region order:
+  --region > $AWS_REGION > $AWS_DEFAULT_REGION > `aws configure get region`
+
+Examples:
+  # All running instances in current region
+  ./set-imds-region.sh
+
+  # Only instances with Name tag = web-prod
+  ./set-imds-region.sh --name web-prod
+
+  # Filter by any tag and include stopped instances
+  ./set-imds-region.sh --tag Environment=prod --state running,stopped
+
+  # Specific instances (no discovery)
+  ./set-imds-region.sh --instance-ids "i-0123 i-0456"
+
+  # See what would happen
+  ./set-imds-region.sh --dry-run
+USAGE
+}
+
+REGION="${1:-}"
+NAME_TAG=""
+GEN_TAG=""
+INSTANCE_IDS=""
+STATES="running"
+PARALLEL=8
+DRYRUN=""
+
+# Re-parse properly
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --region)        REGION="$2"; shift 2 ;;
+    --name)          NAME_TAG="$2"; shift 2 ;;
+    --tag)           GEN_TAG="$2"; shift 2 ;;
+    --instance-ids)  INSTANCE_IDS="$2"; shift 2 ;;
+    --state)         STATES="$2"; shift 2 ;;
+    --parallel)      PARALLEL="$2"; shift 2 ;;
+    --dry-run)       DRYRUN="--dry-run"; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *) echo "Unknown arg: $1"; usage; exit 1 ;;
+  esac
+done
+
+# Resolve region
+REGION="${REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region || true)}}}"
+if [[ -z "$REGION" ]]; then
+  echo "Region not set. Use --region or configure a default." >&2
+  exit 1
+fi
+
+echo "Using region: $REGION"
+
+# Build filter list for discovery (if INSTANCE_IDS not provided)
+FILTERS=( "Name=instance-state-name,Values=${STATES}" )
+if [[ -n "$NAME_TAG" ]]; then
+  FILTERS+=( "Name=tag:Name,Values=${NAME_TAG}" )
+fi
+if [[ -n "$GEN_TAG" ]]; then
+  # Expect Key=Value
+  key="${GEN_TAG%%=*}"
+  val="${GEN_TAG#*=}"
+  if [[ -z "$key" || -z "$val" || "$key" == "$val" ]]; then
+    echo "Invalid --tag. Use Key=Value" >&2; exit 1
+  fi
+  FILTERS+=( "Name=tag:${key},Values=${val}" )
+fi
+
+discover_instances() {
+  local next_token=""
+  local ids=()
+  while :; do
+    if [[ -n "$INSTANCE_IDS" ]]; then
+      # explicit IDs path
+      read -r -a ids <<<"$INSTANCE_IDS"
+      break
+    fi
+    if [[ -n "$next_token" ]]; then NT=(--next-token "$next_token"); else NT=(); fi
+    mapfile -t page_ids < <(aws ec2 describe-instances \
+      --region "$REGION" \
+      --filters "${FILTERS[@]}" \
+      "${NT[@]}" \
+      --query 'Reservations[].Instances[].InstanceId' \
+      --output text | tr '\t' '\n' | awk 'NF')
+    [[ ${#page_ids[@]} -gt 0 ]] && ids+=("${page_ids[@]}")
+    next_token=$(aws ec2 describe-instances \
+      --region "$REGION" \
+      --filters "${FILTERS[@]}" \
+      "${NT[@]}" \
+      --query 'NextToken' --output text 2>/dev/null || true)
+    [[ "$next_token" == "None" || -z "$next_token" ]] && break
+  done
+  printf "%s\n" "${ids[@]}" | awk 'NF' | sort -u
+}
+
+IDS=$(discover_instances || true)
+if [[ -z "$IDS" ]]; then
+  echo "No matching instances found in $REGION." >&2
+  exit 0
+fi
+
+echo "Targeting $(printf "%s\n" "$IDS" | wc -l | awk '{print $1}') instance(s)."
+
+modify_one() {
+  local id="$1"
+  set -e
+  aws ec2 modify-instance-metadata-options \
+    --region "$REGION" \
+    --instance-id "$id" \
+    --http-tokens required \
+    --http-endpoint enabled \
+    $DRYRUN >/dev/null
+  if [[ -z "$DRYRUN" ]]; then
+    aws ec2 describe-instances \
+      --region "$REGION" \
+      --instance-ids "$id" \
+      --query 'Reservations[0].Instances[0].MetadataOptions.{HttpTokens:HttpTokens,HttpEndpoint:HttpEndpoint}' \
+      --output text
+  else
+    echo "DRYRUN OK"
+  fi
+  echo "$id: done" >&2
+}
+
+export -f modify_one
+export REGION DRYRUN
+
+# Run (parallelized)
+printf "%s\n" "$IDS" | xargs -r -n1 -P "$PARALLEL" bash -c 'modify_one "$@"' _
+
+echo "✅ Completed in region: $REGION"
+[[ -n "$DRYRUN" ]] && echo "(dry-run; no changes made)"
